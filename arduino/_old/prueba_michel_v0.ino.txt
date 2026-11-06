@@ -1,0 +1,222 @@
+#include <WiFi.h>
+#include <ETH.h>
+#include <WebSocketsClient.h>
+#include <time.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+
+const uint8_t PIR_1 = 35;
+const uint8_t PIR_2 = 36;
+const uint8_t LD2410_OUT = 32; 
+const uint8_t MQ2_PIN = 4;     
+const uint8_t RELAY_PIN = 14;  
+
+
+unsigned long previousMillis = 0;
+const unsigned long INTERVAL = 5000;
+
+unsigned long tiempoUltimaPresencia = 0;
+const unsigned long TIEMPO_ESPERA_APAGADO = 15000; 
+bool estadoLuzActual = false;
+
+bool eth_connected = false;
+bool ws_connected = false;       
+bool estadoAnteriorPresencia = false; 
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -10800; 
+const int daylightOffset_sec = 0;
+
+const char* SERVER_IP   = "192.168.1.5";
+const int   SERVER_PORT = 8000;
+#define DEVICE_TOKEN "_Nn0EcOlQ-Iizj4HGc4BlS_n1kbxDhd0"
+const char* WS_PATH = "/ws?token=" DEVICE_TOKEN;
+
+WebSocketsClient webSocket;
+
+String obtenerHoraActual() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    return "2026-11-04 10:45:00"; 
+  }
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+
+void enviarEstadoInicialAlBackend() {
+  if (!ws_connected) return;
+
+  bool p1 = digitalRead(PIR_1);
+  bool p2 = digitalRead(PIR_2);
+  bool radar = digitalRead(LD2410_OUT);
+  int humo = analogRead(MQ2_PIN);
+  bool rele = digitalRead(RELAY_PIN);
+  String timestamp = obtenerHoraActual();
+
+  String jsonInit = "{\"token\":\"" + String(DEVICE_TOKEN) + 
+                    "\",\"evento\":\"ESTADO_INICIAL\","
+                    "\"hardware\":{\"pir1\":" + String(p1) + 
+                    ",\"pir2\":" + String(p2) + 
+                    ",\"radar\":" + String(radar) + 
+                    ",\"humo\":" + String(humo) + 
+                    ",\"rele\":" + String(rele) + "},"
+                    "\"timestamp\":\"" + timestamp + "\"}";
+
+  bool enviado = webSocket.sendTXT(jsonInit);
+  if (enviado) {
+    Serial.println("[WS] Estado inicial y detección de componentes enviados al backend");
+  } else {
+    Serial.println("[WS] Error al enviar el estado inicial");
+  }
+}
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Desconectado del servidor WebSocket.");
+      ws_connected = false;
+      break;
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Conectado exitosamente al servidor en: %s\n", WS_PATH);
+      ws_connected = true; 
+      enviarEstadoInicialAlBackend();
+      break;
+    case WStype_TEXT:
+      Serial.printf("[WS] Mensaje recibido del servidor: %s\n", payload);
+      break;
+    case WStype_ERROR:
+      Serial.println("[WS] Error en la conexion WebSocket.");
+      ws_connected = false;
+      break;
+    default:
+      break;
+  }
+}
+
+void WiFiEvent(arduino_event_t *event) {
+  switch (event->event_id) {
+    case ARDUINO_EVENT_ETH_START:
+      Serial.println("ETH: Módulo iniciado.");
+      ETH.setHostname("wt32-eth01-sensor");
+      break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println("ETH: Enlace fisico conectado.");
+      break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      Serial.print("ETH: Conectado, IP asignada: ");
+      Serial.println(ETH.localIP());
+      
+      eth_connected = true;
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+      webSocket.begin(SERVER_IP, SERVER_PORT, WS_PATH);
+      webSocket.onEvent(webSocketEvent);
+      webSocket.setReconnectInterval(5000); 
+      // webSocket.setAuthorization("Bearer", DEVICE_TOKEN);
+      break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+      eth_connected = false;
+      ws_connected = false;
+      break;
+    case ARDUINO_EVENT_ETH_STOP:
+      eth_connected = false;
+      ws_connected = false;
+      break;
+    default:
+      break;
+  }
+}
+
+void enviarReporteCambio(bool p1, bool p2, bool radar, int valorHumo, bool estadoRelie, String evento, String timestamp) {
+  if (!eth_connected || !ws_connected) return;
+
+  String jsonPayload = "{\"token\":\"" + String(DEVICE_TOKEN) + 
+                       "\",\"evento\":\"" + evento + "\","
+                       "\"pir1\":" + String(p1) + 
+                       ",\"pir2\":" + String(p2) + 
+                       ",\"radar\":" + String(radar) + 
+                       ",\"humo\":" + String(valorHumo) + 
+                       ",\"rele\":" + String(estadoRelie) + 
+                       ",\"timestamp\":\"" + timestamp + "\"}";
+
+  bool enviado = webSocket.sendTXT(jsonPayload);
+  if (enviado) {
+    Serial.println("¡Reporte de cambio enviado por WebSocket correctamente!");
+  }
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+  Serial.begin(115200);
+  delay(500);
+
+  WiFi.onEvent(WiFiEvent);
+  ETH.begin(ETH_PHY_LAN8720, 1, 23, 18, 16, ETH_CLOCK_GPIO17_OUT);
+
+  pinMode(PIR_1, INPUT);
+  pinMode(PIR_2, INPUT);
+  pinMode(LD2410_OUT, INPUT);
+  pinMode(MQ2_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); 
+
+  Serial.println("Sistema iniciado. Esperando red...");
+}
+
+void loop() {
+ 
+  webSocket.loop();
+
+  unsigned long currentMillis = millis();
+
+
+  if (currentMillis - previousMillis >= INTERVAL) {
+    previousMillis = currentMillis;
+
+    
+    bool estadoPIR1 = digitalRead(PIR_1);
+    bool estadoPIR2 = digitalRead(PIR_2);
+    bool estadoRadar = digitalRead(LD2410_OUT);
+    int lecturaHumo = analogRead(MQ2_PIN);
+
+    
+    bool hayGente = (estadoPIR1 || estadoPIR2 || estadoRadar);
+
+    if (hayGente) {
+      tiempoUltimaPresencia = millis(); 
+      if (!estadoLuzActual) {
+        estadoLuzActual = true;
+        digitalWrite(RELAY_PIN, HIGH); 
+        Serial.println("[LUCES] Encendidas por detección de presencia.");
+      }
+    } 
+    else {
+      if (estadoLuzActual && (millis() - tiempoUltimaPresencia >= TIEMPO_ESPERA_APAGADO)) {
+        estadoLuzActual = false;
+        digitalWrite(RELAY_PIN, LOW); 
+        Serial.println("[LUCES] Zona despejada por un tiempo prudente. Apagando luces.");
+      }
+    }
+ 
+
+    Serial.print("[Check 5s] P1:"); Serial.print(estadoPIR1);
+    Serial.print(" P2:"); Serial.print(estadoPIR2);
+    Serial.print(" Radar:"); Serial.print(estadoRadar);
+    Serial.print(" Humo:"); Serial.print(lecturaHumo);
+    Serial.print(" Relé 1:"); Serial.println(estadoLuzActual);
+
+    if (hayGente != estadoAnteriorPresencia) {
+      String timestamp = obtenerHoraActual();
+      
+      if (hayGente) {
+        enviarReporteCambio(estadoPIR1, estadoPIR2, estadoRadar, lecturaHumo, estadoLuzActual, "MOVIMIENTO_DETECTADO", timestamp);
+      } else {
+        enviarReporteCambio(estadoPIR1, estadoPIR2, estadoRadar, lecturaHumo, estadoLuzActual, "ZONA_DESPEJADA", timestamp);
+      }
+
+      estadoAnteriorPresencia = hayGente;
+    }
+  }
+}
